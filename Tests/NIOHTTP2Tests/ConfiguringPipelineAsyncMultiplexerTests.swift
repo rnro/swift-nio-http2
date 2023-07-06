@@ -268,7 +268,7 @@ final class ConfiguringPipelineAsyncMultiplexerTests: XCTestCase {
         case .finished(let negotiationResult):
             switch negotiationResult {
             case .http1_1:
-                preconditionFailure("Negotiation result must be ready")
+                preconditionFailure("Negotiation result must be http/2")
             case .http2(let (_, multiplexer)):
                 serverMultiplexer = multiplexer
             }
@@ -355,6 +355,7 @@ final class ConfiguringPipelineAsyncMultiplexerTests: XCTestCase {
             // we need to put these through a mapping to remove references to `IOData` which isn't Sendable
             try await self.clientChannel.writeOutbound(HTTP1ClientSendability.RequestPart.head(ConfiguringPipelineAsyncMultiplexerTests.requestHead))
             try await self.clientChannel.writeOutbound(HTTP1ClientSendability.RequestPart.end(nil))
+
             try await self.deliverAllBytes(from: self.clientChannel, to: self.serverChannel)
             try await self.deliverAllBytes(from: self.serverChannel, to: self.clientChannel)
         }
@@ -376,6 +377,217 @@ final class ConfiguringPipelineAsyncMultiplexerTests: XCTestCase {
 
         try await assertNoThrow(try await self.clientChannel.finish())
         try await assertNoThrow(try await self.serverChannel.finish())
+    }
+
+    // `testNegotiatedNIOAsyncChannelHTTP2PipelineCommunicates` ensures that a client-server system set up to use `NIOAsyncChannel`
+    // wrappers around channels can communicate successfully when HTTP/2 is negotiated.
+    func testNegotiatedNIOAsyncChannelHTTP2PipelineCommunicates() async throws {
+        let requestCount = 100
+
+        let (clientConnectionAsyncChannel, clientMultiplexer) = try await assertNoThrowWithValue(
+            try await self.clientChannel.configureAsyncHTTP2Pipeline(
+                mode: .client,
+                configuration: .init(
+                    connectionAsyncChannel: NIOAsyncChannel.Configuration(inboundType: HTTP2Frame.self, outboundType: HTTP2Frame.self),
+                    inboundStreamAsyncChannel: NIOAsyncChannel.Configuration(inboundType: HTTP2Frame.FramePayload.self, outboundType: HTTP2Frame.FramePayload.self)
+                ) { channel in
+                    channel.eventLoop.makeSucceededVoidFuture()
+                } inboundStreamInitializer: { channel in
+                    channel.eventLoop.makeSucceededVoidFuture()
+                }
+            ).get()
+        )
+
+        let nioProtocolNegotiationHandler = try await self.serverChannel.configureAsyncHTTPServerPipeline(
+            http1Configuration: .init(
+                connectionAsyncChannel: NIOAsyncChannel.Configuration(inboundType: HTTPServerRequestPart.self, outboundType: HTTP1ServerSendability.ResponsePart.self)
+            ) { channel in
+                channel.eventLoop.makeSucceededVoidFuture()
+            },
+            http2Configuration: .init(
+                connectionAsyncChannel: NIOAsyncChannel.Configuration(inboundType: HTTP2Frame.self, outboundType: HTTP2Frame.self),
+                inboundStreamAsyncChannel: NIOAsyncChannel.Configuration(inboundType: HTTP2Frame.FramePayload.self, outboundType: HTTP2Frame.FramePayload.self)
+            ) { channel in
+                channel.eventLoop.makeSucceededVoidFuture()
+            } inboundStreamInitializer: { channel in
+                channel.eventLoop.makeSucceededVoidFuture()
+            }
+        ).get()
+
+        // Let's pretend the TLS handler did protocol negotiation for us
+        self.serverChannel.pipeline.fireUserInboundEventTriggered(TLSUserEvent.handshakeCompleted(negotiatedProtocol: "h2"))
+
+        let nioProtocolNegotiationResult = try await nioProtocolNegotiationHandler.protocolNegotiationResult.get()
+
+        try await assertNoThrow(try await self.assertDoHandshake(client: self.clientChannel, server: self.serverChannel))
+
+        let serverMultiplexer: NIOHTTP2Handler.AsyncStreamMultiplexer<NIOAsyncChannel<HTTP2Frame.FramePayload, HTTP2Frame.FramePayload>>
+        switch nioProtocolNegotiationResult {
+        case .deferredResult:
+            preconditionFailure("Negotiation result must be ready")
+        case .finished(let negotiationResult):
+            switch negotiationResult {
+            case .http1_1:
+                preconditionFailure("Negotiation result must be http/2")
+            case .http2(let (_, multiplexer)):
+                serverMultiplexer = multiplexer
+            }
+        }
+
+        try await withThrowingTaskGroup(of: Int.self, returning: Void.self) { group in
+            // server
+            group.addTask {
+                var serverInboundChannelCount = 0
+                for try await streamChannel in serverMultiplexer.inbound {
+                    for try await receivedFrame in streamChannel.inboundStream {
+                        receivedFrame.assertFramePayloadMatches(this: ConfiguringPipelineAsyncMultiplexerTests.requestFramePayload)
+
+                        try await streamChannel.outboundWriter.write(ConfiguringPipelineAsyncMultiplexerTests.responseFramePayload)
+                        streamChannel.outboundWriter.finish()
+
+                        try await self.deliverAllBytes(from: self.serverChannel, to: self.clientChannel)
+                    }
+                    serverInboundChannelCount += 1
+                }
+                return serverInboundChannelCount
+            }
+
+            // client
+            try await withThrowingTaskGroup(of: Void.self, returning: Void.self) { clientGroup in
+                clientGroup.addTask {
+                    for try await inbound in clientConnectionAsyncChannel.inboundStream {
+                        _ = inbound
+                    }
+                    return
+                }
+
+                for _ in 0 ..< requestCount {
+                    let streamChannel = try await clientMultiplexer.createStreamChannel(
+                        configuration: .init(
+                            inboundType: HTTP2Frame.FramePayload.self,
+                            outboundType: HTTP2Frame.FramePayload.self
+                        )
+                    ) { channel -> EventLoopFuture<Void> in
+                        channel.eventLoop.makeSucceededVoidFuture()
+                    }
+                    // Let's try sending some requests
+                    try await streamChannel.outboundWriter.write(ConfiguringPipelineAsyncMultiplexerTests.requestFramePayload)
+                    streamChannel.outboundWriter.finish()
+
+                    try await self.deliverAllBytes(from: self.clientChannel, to: self.serverChannel)
+
+                    for try await receivedFrame in streamChannel.inboundStream {
+                        receivedFrame.assertFramePayloadMatches(this: ConfiguringPipelineAsyncMultiplexerTests.responseFramePayload)
+                    }
+                }
+
+                try await assertNoThrow(try await self.clientChannel.finish())
+
+                try await clientGroup.next()!
+            }
+
+            try await assertNoThrow(try await self.serverChannel.finish())
+
+            let serverInboundChannelCount = try await assertNoThrowWithValue(try await group.next()!)
+            XCTAssertEqual(serverInboundChannelCount, requestCount, "We should have created one server-side channel as a result of the one HTTP/2 stream used.")
+        }
+    }
+
+    // `testNegotiatedNIOAsyncChannelHTTP1PipelineCommunicates` ensures that a client-server system set up to use `NIOAsyncChannel`
+    // wrappers around channels can communicate successfully when HTTP/1.1 is negotiated.
+    func testNegotiatedNIOAsyncChannelHTTP1PipelineCommunicates() async throws {
+        let requestCount = 100
+
+        let clientAsyncChannel = try await self.clientChannel.pipeline.addHTTPClientHandlers().flatMap { _ in
+            self.clientChannel.pipeline.addHandler(HTTP1ClientSendability())
+        }.flatMapThrowing { _ in
+            try NIOAsyncChannel(
+                synchronouslyWrapping: self.clientChannel,
+                configuration: .init(
+                    inboundType: HTTPClientResponsePart.self,
+                    outboundType: HTTP1ClientSendability.RequestPart.self
+                )
+            )
+        }.get()
+
+        let nioProtocolNegotiationHandler = try await self.serverChannel.configureAsyncHTTPServerPipeline(
+            http1Configuration: .init(
+                connectionAsyncChannel: NIOAsyncChannel.Configuration(inboundType: HTTPServerRequestPart.self, outboundType: HTTP1ServerSendability.ResponsePart.self)
+            ) { channel in
+                channel.pipeline.addHandler(HTTP1ServerSendability())
+            },
+            http2Configuration: .init(
+                connectionAsyncChannel: NIOAsyncChannel.Configuration(inboundType: HTTP2Frame.self, outboundType: HTTP2Frame.self),
+                inboundStreamAsyncChannel: NIOAsyncChannel.Configuration(inboundType: HTTP2Frame.FramePayload.self, outboundType: HTTP2Frame.FramePayload.self)
+            ) { channel in
+                channel.eventLoop.makeSucceededVoidFuture()
+            } inboundStreamInitializer: { channel in
+                channel.eventLoop.makeSucceededVoidFuture()
+            }
+        ).get()
+
+        // Let's pretend the TLS handler did protocol negotiation for us
+        self.serverChannel.pipeline.fireUserInboundEventTriggered(TLSUserEvent.handshakeCompleted(negotiatedProtocol: "http/1.1"))
+
+        let nioProtocolNegotiationResult = try await nioProtocolNegotiationHandler.protocolNegotiationResult.get()
+
+        try await self.deliverAllBytes(from: self.clientChannel, to: self.serverChannel)
+        try await self.deliverAllBytes(from: self.serverChannel, to: self.clientChannel)
+
+        let serverAsyncChannel: NIOAsyncChannel<HTTPServerRequestPart, HTTP1ServerSendability.ResponsePart>
+        switch nioProtocolNegotiationResult {
+        case .deferredResult:
+            preconditionFailure("Negotiation result must be ready")
+        case .finished(let negotiationResult):
+            switch negotiationResult {
+            case .http1_1(let asyncChannel):
+                serverAsyncChannel = asyncChannel
+            case .http2:
+                preconditionFailure("Negotiation result must be http/1.1")
+            }
+        }
+
+        try await withThrowingTaskGroup(of: Int.self, returning: Void.self) { group in
+            // server
+            group.addTask {
+                var serverRequestCount = 0
+                for try await requestPart in serverAsyncChannel.inboundStream {
+                    switch requestPart {
+                    case .head(let head):
+                        XCTAssertEqual(head, ConfiguringPipelineAsyncMultiplexerTests.requestHead, "Malformed request head")
+                    case .body:
+                        XCTFail("Unexpected request part")
+                    case .end:
+                        try await serverAsyncChannel.outboundWriter.write(.head(ConfiguringPipelineAsyncMultiplexerTests.responseHead))
+                        try await serverAsyncChannel.outboundWriter.write(.end(nil))
+                        try await self.deliverAllBytes(from: self.serverChannel, to: self.clientChannel)
+                        serverRequestCount += 1
+                    }
+                }
+                serverAsyncChannel.outboundWriter.finish()
+                return serverRequestCount
+            }
+
+            // client
+            var iterator = clientAsyncChannel.inboundStream.makeAsyncIterator()
+            for _ in 0 ..< requestCount {
+                // Let's try sending some requests
+                try await clientAsyncChannel.outboundWriter.write(HTTP1ClientSendability.RequestPart.head(ConfiguringPipelineAsyncMultiplexerTests.requestHead))
+                try await clientAsyncChannel.outboundWriter.write(HTTP1ClientSendability.RequestPart.end(nil))
+                try await self.deliverAllBytes(from: self.clientChannel, to: self.serverChannel)
+
+                try await assertEqual(try await iterator.next(), HTTPClientResponsePart.head(ConfiguringPipelineAsyncMultiplexerTests.responseHead))
+                try await assertEqual(try await iterator.next(), HTTPClientResponsePart.end(nil))
+            }
+
+            clientAsyncChannel.outboundWriter.finish()
+
+            try await assertNoThrow(try await self.clientChannel.finish())
+            try await assertNoThrow(try await self.serverChannel.finish())
+
+            let serverInboundChannelCount = try await assertNoThrowWithValue(try await group.next()!)
+            XCTAssertEqual(serverInboundChannelCount, requestCount, "We should have created one server-side channel as a result of the one HTTP/2 stream used.")
+        }
     }
 
     // Simple handler which maps client request parts to remove references to `IOData` which isn't Sendable

@@ -274,7 +274,7 @@ extension Channel {
     ///
     /// - Parameters:
     ///   - mode: The mode this pipeline will operate in, server or client.
-    ///   - inboundStreamAsyncChannelConfiguration: Settings relating to `NIOAsyncChannel`s wrapping internal stream channels
+    ///   - inboundStreamAsyncChannelConfiguration: Settings relating to `NIOAsyncChannel`s wrapping internal stream channels.
     ///   - connectionConfiguration: The settings that will be used when establishing the connection. These will be sent to the peer as part of the
     ///         handshake.
     ///   - streamConfiguration: The settings that will be used when establishing new streams. These mainly pertain to flow control.
@@ -583,6 +583,56 @@ extension Channel {
         )
     }
 
+    /// Configures a `ChannelPipeline` to speak either HTTP/1.1 or HTTP/2 according to what can be negotiated with the client
+    /// and wraps both the connection channels and any created inbound stream channels in `NIOAsyncChannel`s.
+    ///
+    /// This helper takes care of configuring the server pipeline such that it negotiates whether to
+    /// use HTTP/1.1 or HTTP/2.
+    ///
+    /// This function doesn't configure the TLS handler. Callers of this function need to add a TLS
+    /// handler appropriately configured to perform protocol negotiation.
+    ///
+    /// - Parameters:
+    ///   - http1Configuration: The settings and initialization configuration for HTTP/1.1 connections and their wrapping ``NIOAsyncChannel``s.
+    ///   - http2Configuration: The settings and initialization configuration for HTTP/2 connections. This configures
+    ///     both connections and streams, and their wrapping ``NIOAsyncChannel``s.
+    /// - Returns: An `EventLoopFuture` containing a ``NIOTypedApplicationProtocolNegotiationHandler`` that completes when the channel
+    ///     is ready to negotiate. This can then be used to access the ``NIOProtocolNegotiationResult`` which may itself
+    ///     be waited on to retrieve the result of the negotiation
+    @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+    @_spi(AsyncChannel)
+    public func configureAsyncHTTPServerPipeline<HTTP1ConnectionInbound, HTTP1ConnectionOutbound, HTTP2ConnectionInbound, HTTP2ConnectionOutbound, HTTP2StreamInbound, HTTP2StreamOutbound>(
+        http1Configuration: NIOHTTP1AsyncConfiguration<HTTP1ConnectionInbound, HTTP1ConnectionOutbound>,
+        http2Configuration: NIOHTTP2AsyncConfiguration<HTTP2ConnectionInbound, HTTP2ConnectionOutbound, HTTP2StreamInbound, HTTP2StreamOutbound>
+    ) throws -> EventLoopFuture<NIOTypedApplicationProtocolNegotiationHandler<NIONegotiatedHTTPVersion<
+        NIOAsyncChannel<HTTP1ConnectionInbound, HTTP1ConnectionOutbound>,
+        (NIOAsyncChannel<HTTP2ConnectionInbound, HTTP2ConnectionOutbound>, NIOHTTP2Handler.AsyncStreamMultiplexer<NIOAsyncChannel<HTTP2StreamInbound, HTTP2StreamOutbound>>)
+    >>> {
+        let http2ConnectionInitializer: NIOChannelInitializerWithOutput<(
+            NIOAsyncChannel<HTTP2ConnectionInbound, HTTP2ConnectionOutbound>,
+            NIOHTTP2Handler.AsyncStreamMultiplexer<NIOAsyncChannel<HTTP2StreamInbound, HTTP2StreamOutbound>>
+        )> = { channel in
+            channel.configureAsyncHTTP2Pipeline(
+                mode: .server,
+                configuration: http2Configuration
+            )
+        }
+        let http1ConnectionInitializer: NIOChannelInitializerWithOutput<NIOAsyncChannel<HTTP1ConnectionInbound, HTTP1ConnectionOutbound>> = { channel in
+            channel.pipeline.configureHTTPServerPipeline().flatMap { _ in
+                http1Configuration.connectionInitializer(channel)
+            }.flatMapThrowing { _ in
+                try NIOAsyncChannel<HTTP1ConnectionInbound, HTTP1ConnectionOutbound>(
+                   synchronouslyWrapping: self,
+                   configuration: http1Configuration.connectionAsyncChannel
+               )
+            }
+        }
+        return self.configureHTTP2AsyncSecureUpgrade(
+            http1ConnectionInitializer: http1ConnectionInitializer,
+            http2ConnectionInitializer: http2ConnectionInitializer
+        )
+    }
+
     /// Configures a `ChannelPipeline` to speak HTTP/2 and wraps both the connection channel and any
     /// created inbound stream channels in `NIOAsyncChannel`s.
     ///
@@ -725,7 +775,7 @@ extension ChannelPipeline.SynchronousOperations {
     ///
     /// - Parameters:
     ///   - mode: The mode this pipeline will operate in, server or client.
-    ///   - inboundStreamAsyncChannelConfiguration: Settings relating to `NIOAsyncChannel`s wrapping internal stream channels
+    ///   - inboundStreamAsyncChannelConfiguration: Settings relating to `NIOAsyncChannel`s wrapping internal stream channels.
     ///   - connectionConfiguration: The settings that will be used when establishing the connection. These will be sent to the peer as part of the
     ///         handshake.
     ///   - streamConfiguration: The settings that will be used when establishing new streams. These mainly pertain to flow control.
@@ -766,6 +816,23 @@ extension ChannelPipeline.SynchronousOperations {
 public enum NIONegotiatedHTTPVersion<HTTP1Output: Sendable, HTTP2Output: Sendable> {
     case http1_1(HTTP1Output)
     case http2(HTTP2Output)
+}
+
+/// `HTTP1AsyncConfiguration` contains all configuration required for setting up an HTTP/1.1 async connection.
+@available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+@_spi(AsyncChannel)
+public struct NIOHTTP1AsyncConfiguration<ConnectionInbound: Sendable, ConnectionOutbound: Sendable> {
+    public var connectionAsyncChannel: NIOAsyncChannel<ConnectionInbound, ConnectionOutbound>.Configuration
+
+    public var connectionInitializer: NIOChannelInitializer
+
+    public init(
+        connectionAsyncChannel: NIOAsyncChannel<ConnectionInbound, ConnectionOutbound>.Configuration,
+        connectionInitializer: @escaping NIOChannelInitializer
+    ) {
+        self.connectionAsyncChannel = connectionAsyncChannel
+        self.connectionInitializer = connectionInitializer
+    }
 }
 
 /// `NIOHTTP2AsyncConfiguration` contains all configuration required for setting up an HTTP/2 async connection.
@@ -809,4 +876,8 @@ public struct NIOHTTP2AsyncConfiguration<HTTP2ConnectionInbound: Sendable, HTTP2
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
 @_spi(AsyncChannel)
 extension NIOHTTP2AsyncConfiguration: @unchecked Sendable {}
+
+@available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+@_spi(AsyncChannel)
+extension NIOHTTP1AsyncConfiguration: @unchecked Sendable {}
 #endif
